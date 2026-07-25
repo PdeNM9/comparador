@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from io import BytesIO
 import re
+from typing import Mapping
 
 import pandas as pd
 from openpyxl.styles import Alignment, Font, PatternFill
@@ -35,6 +36,28 @@ def dataframe_to_excel_bytes(
     return output.getvalue()
 
 
+def workbook_to_excel_bytes(sheets: Mapping[str, pd.DataFrame]) -> bytes:
+    """Serialize multiple dataframes to a formatted .xlsx workbook."""
+    if not sheets:
+        return dataframe_to_excel_bytes(pd.DataFrame(), "Dados")
+
+    output = BytesIO()
+    used_sheet_names: set[str] = set()
+
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        for requested_name, dataframe in sheets.items():
+            safe_name = _dedupe_sheet_name(
+                _safe_sheet_name(requested_name),
+                used_sheet_names,
+            )
+            dataframe.to_excel(writer, index=False, sheet_name=safe_name)
+            worksheet = writer.sheets[safe_name]
+            _format_worksheet(worksheet, dataframe)
+
+    output.seek(0)
+    return output.getvalue()
+
+
 def timestamped_filename(prefix: str) -> str:
     """Build a stable download filename with the current local timestamp."""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -44,6 +67,17 @@ def timestamped_filename(prefix: str) -> str:
 def _safe_sheet_name(sheet_name: str) -> str:
     cleaned = re.sub(r"[\[\]:*?/\\]", "_", sheet_name).strip()
     return (cleaned or "Dados")[:31]
+
+
+def _dedupe_sheet_name(sheet_name: str, used_sheet_names: set[str]) -> str:
+    candidate = sheet_name[:31]
+    counter = 2
+    while candidate in used_sheet_names:
+        suffix = f" ({counter})"
+        candidate = f"{sheet_name[:31 - len(suffix)]}{suffix}"
+        counter += 1
+    used_sheet_names.add(candidate)
+    return candidate
 
 
 def _format_worksheet(worksheet, dataframe: pd.DataFrame) -> None:

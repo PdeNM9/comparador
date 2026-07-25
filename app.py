@@ -1,33 +1,56 @@
-"""Streamlit app for comparing judicial process Excel spreadsheets."""
+"""Streamlit app for productivity comparison by judicial server."""
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import hashlib
-from typing import Any
+from pathlib import Path
 
 import pandas as pd
 import streamlit as st
 
-from charts import build_bar_chart, build_pie_chart
-from comparison import ComparisonError, ComparisonResult, SheetConfig, compare_sheets
+from charts import (
+    build_pie_chart,
+    build_productivity_by_server_chart,
+    build_productivity_rate_chart,
+)
 from dashboard import (
     configure_page,
-    guess_annotation_columns,
-    guess_column,
+    format_int,
     inject_styles,
     render_filterable_table,
     render_header,
-    render_metric_cards,
-    render_quality_messages,
+    render_productivity_metric_cards,
+    render_productivity_quality_messages,
 )
 from excel_utils import ExcelProcessingError, read_excel_sheet, read_sheet_names
-from export import EXCEL_MIME_TYPE, dataframe_to_excel_bytes, timestamped_filename
+from export import (
+    EXCEL_MIME_TYPE,
+    dataframe_to_excel_bytes,
+    timestamped_filename,
+    workbook_to_excel_bytes,
+)
+from productivity import (
+    ProductivityError,
+    ProductivityResult,
+    build_productivity_report,
+    read_workbook_sheets,
+)
 
 
-OLD_FILE_KEY = "old_file"
-NEW_FILE_KEY = "new_file"
-RESULT_KEY = "comparison_result"
-SIGNATURE_KEY = "comparison_signature"
+SERVER_FILE_KEY = "server_file"
+CURRENT_FILE_KEY = "current_file"
+RESULT_KEY = "productivity_result"
+SIGNATURE_KEY = "productivity_signature"
+
+
+@dataclass(frozen=True)
+class WorkbookInput:
+    """Workbook bytes selected by upload or local project file."""
+
+    name: str
+    bytes_data: bytes
+    source_label: str
 
 
 @st.cache_data(show_spinner=False)
@@ -42,14 +65,49 @@ def cached_read_sheet(
     file_name: str,
     sheet_name: str,
 ) -> pd.DataFrame:
-    """Cache worksheet loading for the selected sheet."""
+    """Cache worksheet loading for the selected current sheet."""
     return read_excel_sheet(file_bytes, file_name, sheet_name)
 
 
 @st.cache_data(show_spinner=False)
+def cached_read_workbook(
+    file_bytes: bytes,
+    file_name: str,
+) -> dict[str, pd.DataFrame]:
+    """Cache loading of every server worksheet."""
+    return read_workbook_sheets(file_bytes, file_name)
+
+
+@st.cache_data(show_spinner=False)
+def cached_local_file(path: str, mtime_ns: int) -> bytes:
+    """Cache local workbook bytes from the project folder."""
+    return Path(path).read_bytes()
+
+
+@st.cache_data(show_spinner=False)
 def cached_excel_bytes(dataframe: pd.DataFrame, sheet_name: str) -> bytes:
-    """Cache Excel serialization to keep download buttons responsive."""
+    """Cache one-table Excel serialization."""
     return dataframe_to_excel_bytes(dataframe, sheet_name)
+
+
+@st.cache_data(show_spinner=False)
+def cached_report_bytes(
+    summary_by_server: pd.DataFrame,
+    current_enriched: pd.DataFrame,
+    productive_processes: pd.DataFrame,
+    new_processes: pd.DataFrame,
+    old_comparison: pd.DataFrame,
+) -> bytes:
+    """Cache the full multi-sheet report."""
+    return workbook_to_excel_bytes(
+        {
+            "Resumo por servidor": summary_by_server,
+            "Atual enriquecida": current_enriched,
+            "Produtivos - saíram": productive_processes,
+            "Novos": new_processes,
+            "Lista antiga comparada": old_comparison,
+        }
+    )
 
 
 def main() -> None:
@@ -58,351 +116,295 @@ def main() -> None:
     inject_styles()
     render_header()
 
-    old_upload, new_upload = _render_upload_area()
-    if not old_upload or not new_upload:
-        st.info("Envie as duas planilhas .xlsx para liberar a configuração.")
+    workbook_inputs = _render_input_area()
+    if workbook_inputs is None:
+        st.info("Envie os dois arquivos .xlsx ou use os arquivos detectados na pasta.")
         return
 
-    try:
-        old_bytes = old_upload.getvalue()
-        new_bytes = new_upload.getvalue()
-        old_sheet_names = cached_sheet_names(old_bytes, old_upload.name)
-        new_sheet_names = cached_sheet_names(new_bytes, new_upload.name)
-    except ExcelProcessingError as exc:
-        st.error(str(exc))
-        return
+    server_workbook, current_workbook = workbook_inputs
 
     try:
-        selection = _render_sidebar_configuration(
-            old_bytes,
-            old_upload.name,
-            old_sheet_names,
-            new_bytes,
-            new_upload.name,
-            new_sheet_names,
+        server_sheet_names = cached_sheet_names(
+            server_workbook.bytes_data,
+            server_workbook.name,
+        )
+        current_sheet_names = cached_sheet_names(
+            current_workbook.bytes_data,
+            current_workbook.name,
         )
     except ExcelProcessingError as exc:
         st.error(str(exc))
         return
 
-    if selection is None:
-        return
-
-    (
-        old_dataframe,
-        new_dataframe,
-        old_sheet_name,
-        new_sheet_name,
-        old_config,
-        new_config,
-    ) = selection
-
+    current_sheet_name = _render_sidebar_configuration(
+        server_workbook,
+        current_workbook,
+        server_sheet_names,
+        current_sheet_names,
+    )
     current_signature = _build_signature(
-        old_bytes,
-        new_bytes,
-        old_sheet_name,
-        new_sheet_name,
-        old_config,
-        new_config,
+        server_workbook.bytes_data,
+        current_workbook.bytes_data,
+        current_sheet_name,
     )
 
     if st.sidebar.button(
-        "Comparar planilhas",
+        "Processar produtividade",
         type="primary",
-        use_container_width=True,
+        width="stretch",
     ):
-        _run_comparison(
-            old_dataframe,
-            new_dataframe,
-            old_config,
-            new_config,
+        _run_productivity_report(
+            server_workbook,
+            current_workbook,
+            current_sheet_name,
             current_signature,
         )
 
     result = st.session_state.get(RESULT_KEY)
     if result is None:
-        st.info("Configure as colunas e clique em Comparar planilhas.")
+        st.info("Clique em Processar produtividade para montar o painel.")
         return
 
     if st.session_state.get(SIGNATURE_KEY) != current_signature:
         st.warning(
-            "A configuração ou algum arquivo foi alterado depois da última "
-            "comparação. Clique em Comparar planilhas para atualizar o painel."
+            "Arquivos ou aba atual mudaram depois do último processamento. "
+            "Clique em Processar produtividade para atualizar o painel."
         )
 
     _render_results(result)
 
 
-def _render_upload_area():
-    st.subheader("Upload")
+def _render_input_area() -> tuple[WorkbookInput, WorkbookInput] | None:
+    st.subheader("Arquivos")
     left, right = st.columns(2)
     with left:
-        old_upload = st.file_uploader(
-            "Planilha 1 - situação anterior",
+        server_upload = st.file_uploader(
+            "Lista 01.26 - abas por servidor",
             type=["xlsx"],
-            key=OLD_FILE_KEY,
-            help="Arquivo Excel .xlsx com a situação anterior.",
+            key=SERVER_FILE_KEY,
         )
     with right:
-        new_upload = st.file_uploader(
-            "Planilha 2 - situação atual",
+        current_upload = st.file_uploader(
+            "Arquivo atual - 120 dias",
             type=["xlsx"],
-            key=NEW_FILE_KEY,
-            help="Arquivo Excel .xlsx com a situação atual.",
+            key=CURRENT_FILE_KEY,
         )
-    return old_upload, new_upload
+
+    local_files = _local_xlsx_files()
+    use_local = False
+    if local_files and not (server_upload and current_upload):
+        use_local = st.checkbox(
+            "Usar arquivos .xlsx detectados na pasta do projeto",
+            value=server_upload is None and current_upload is None,
+        )
+
+    if use_local:
+        local_left, local_right = st.columns(2)
+        with local_left:
+            server_path = st.selectbox(
+                "Arquivo dos servidores",
+                options=local_files,
+                index=_guess_file_index(local_files, ("lista", "01.26")),
+                format_func=lambda path: path.name,
+            )
+        with local_right:
+            current_path = st.selectbox(
+                "Arquivo atual",
+                options=local_files,
+                index=_guess_file_index(local_files, ("120", "dias")),
+                format_func=lambda path: path.name,
+            )
+
+        if server_path == current_path:
+            st.error("Selecione dois arquivos diferentes.")
+            return None
+
+        try:
+            return (
+                _local_workbook_input(server_path),
+                _local_workbook_input(current_path),
+            )
+        except OSError as exc:
+            st.error(f"Não foi possível ler os arquivos locais: {exc}")
+            return None
+
+    if not server_upload or not current_upload:
+        return None
+
+    return (
+        WorkbookInput(
+            name=server_upload.name,
+            bytes_data=server_upload.getvalue(),
+            source_label="upload",
+        ),
+        WorkbookInput(
+            name=current_upload.name,
+            bytes_data=current_upload.getvalue(),
+            source_label="upload",
+        ),
+    )
 
 
 def _render_sidebar_configuration(
-    old_bytes: bytes,
-    old_file_name: str,
-    old_sheet_names: list[str],
-    new_bytes: bytes,
-    new_file_name: str,
-    new_sheet_names: list[str],
-):
+    server_workbook: WorkbookInput,
+    current_workbook: WorkbookInput,
+    server_sheet_names: list[str],
+    current_sheet_names: list[str],
+) -> str:
     with st.sidebar:
         st.header("Configuração")
-        old_sheet_name = _safe_selectbox(
-            "Aba da Planilha 1",
-            old_sheet_names,
-            "old_sheet_name",
-            old_sheet_names[0],
-        )
-        new_sheet_name = _safe_selectbox(
-            "Aba da Planilha 2",
-            new_sheet_names,
-            "new_sheet_name",
-            new_sheet_names[0],
-        )
+        st.caption(f"Servidores: {server_workbook.name}")
+        st.caption(f"Abas detectadas: {format_int(len(server_sheet_names))}")
+        st.caption(f"Atual: {current_workbook.name}")
 
-    old_dataframe = cached_read_sheet(old_bytes, old_file_name, old_sheet_name)
-    new_dataframe = cached_read_sheet(new_bytes, new_file_name, new_sheet_name)
-
-    old_columns = list(old_dataframe.columns)
-    new_columns = list(new_dataframe.columns)
-    if not old_columns:
-        st.error("A Planilha 1 não possui colunas para seleção.")
-        return None
-    if not new_columns:
-        st.error("A Planilha 2 não possui colunas para seleção.")
-        return None
-
-    with st.sidebar:
-        st.caption(
-            f"Planilha 1: {len(old_dataframe):,} linhas".replace(",", ".")
-        )
-        st.caption(
-            f"Planilha 2: {len(new_dataframe):,} linhas".replace(",", ".")
-        )
-        st.divider()
-        st.subheader("Planilha 1")
-        old_cnj_column = _safe_selectbox(
-            "Coluna CNJ",
-            old_columns,
-            "old_cnj_column",
-            guess_column(old_columns, ("cnj", "processo", "numero", "número")),
-        )
-        old_responsible_column = _safe_selectbox(
-            "Coluna responsável",
-            old_columns,
-            "old_responsible_column",
-            guess_column(
-                old_columns,
-                ("responsavel", "responsável", "advogado", "servidor"),
-            ),
-        )
-
-        annotation_options = [
-            column
-            for column in old_columns
-            if column not in {old_cnj_column, old_responsible_column}
-        ]
-        default_annotations = [
-            column
-            for column in guess_annotation_columns(annotation_options)
-            if column in annotation_options
-        ]
-        old_annotation_columns = _safe_multiselect(
-            "Colunas de anotações",
-            annotation_options,
-            "old_annotation_columns",
-            default_annotations,
-        )
-
-        if not old_annotation_columns:
-            st.warning(
-                "Nenhuma coluna de anotação foi selecionada. O arquivo final "
-                "será gerado, mas sem transferência de anotações."
+        if len(current_sheet_names) == 1:
+            current_sheet_name = current_sheet_names[0]
+            st.caption(f"Aba atual: {current_sheet_name}")
+        else:
+            current_sheet_name = st.selectbox(
+                "Aba do arquivo atual",
+                options=current_sheet_names,
+                index=0,
             )
 
-        st.divider()
-        st.subheader("Planilha 2")
-        new_cnj_column = _safe_selectbox(
-            "Coluna CNJ",
-            new_columns,
-            "new_cnj_column",
-            guess_column(new_columns, ("cnj", "processo", "numero", "número")),
-        )
-        new_responsible_column = _safe_selectbox(
-            "Coluna responsável",
-            new_columns,
-            "new_responsible_column",
-            guess_column(
-                new_columns,
-                ("responsavel", "responsável", "advogado", "servidor"),
-            ),
-        )
+        with st.expander("Servidores detectados"):
+            st.write(", ".join(server_sheet_names))
 
-    old_config = SheetConfig(
-        cnj_column=old_cnj_column,
-        responsible_column=old_responsible_column,
-        annotation_columns=tuple(old_annotation_columns),
-    )
-    new_config = SheetConfig(
-        cnj_column=new_cnj_column,
-        responsible_column=new_responsible_column,
-    )
-    return (
-        old_dataframe,
-        new_dataframe,
-        old_sheet_name,
-        new_sheet_name,
-        old_config,
-        new_config,
-    )
+    return current_sheet_name
 
 
-def _safe_selectbox(
-    label: str,
-    options: list[Any],
-    key: str,
-    default: Any,
-) -> Any:
-    if key in st.session_state and st.session_state[key] not in options:
-        del st.session_state[key]
-
-    index = options.index(default) if default in options else 0
-    return st.selectbox(
-        label,
-        options=options,
-        index=index,
-        key=key,
-        format_func=str,
-    )
-
-
-def _safe_multiselect(
-    label: str,
-    options: list[Any],
-    key: str,
-    default: list[Any],
-) -> list[Any]:
-    if key in st.session_state:
-        st.session_state[key] = [
-            value for value in st.session_state[key] if value in options
-        ]
-        return st.multiselect(
-            label,
-            options=options,
-            key=key,
-            format_func=str,
-        )
-
-    return st.multiselect(
-        label,
-        options=options,
-        default=default,
-        key=key,
-        format_func=str,
-    )
-
-
-def _run_comparison(
-    old_dataframe: pd.DataFrame,
-    new_dataframe: pd.DataFrame,
-    old_config: SheetConfig,
-    new_config: SheetConfig,
+def _run_productivity_report(
+    server_workbook: WorkbookInput,
+    current_workbook: WorkbookInput,
+    current_sheet_name: str,
     current_signature: str,
 ) -> None:
-    progress = st.progress(0, text="Validando seleção das colunas")
+    progress = st.progress(0, text="Lendo abas dos servidores")
     try:
-        progress.progress(25, text="Normalizando números CNJ")
-        progress.progress(50, text="Comparando processos")
-        result = compare_sheets(
-            old_dataframe,
-            new_dataframe,
-            old_config,
-            new_config,
+        server_sheets = cached_read_workbook(
+            server_workbook.bytes_data,
+            server_workbook.name,
         )
-        progress.progress(85, text="Preparando painel e exportações")
+        progress.progress(30, text="Lendo arquivo atual")
+        current_dataframe = cached_read_sheet(
+            current_workbook.bytes_data,
+            current_workbook.name,
+            current_sheet_name,
+        )
+        progress.progress(55, text="Normalizando CNJs")
+        result = build_productivity_report(
+            server_sheets=server_sheets,
+            current_dataframe=current_dataframe,
+            current_sheet_name=current_sheet_name,
+        )
+        progress.progress(85, text="Preparando tabelas e exportações")
         st.session_state[RESULT_KEY] = result
         st.session_state[SIGNATURE_KEY] = current_signature
-        progress.progress(100, text="Comparação concluída")
-        st.success("Comparação concluída com sucesso.")
-    except (ComparisonError, ExcelProcessingError) as exc:
+        progress.progress(100, text="Produtividade processada")
+        st.success("Produtividade processada com sucesso.")
+    except (ExcelProcessingError, ProductivityError) as exc:
         st.error(str(exc))
     finally:
         progress.empty()
 
 
-def _render_results(result: ComparisonResult) -> None:
-    render_metric_cards(result)
-    render_quality_messages(result)
+def _render_results(result: ProductivityResult) -> None:
+    render_productivity_metric_cards(result)
+    render_productivity_quality_messages(result)
 
-    st.subheader("Gráficos")
+    st.subheader("Produtividade por servidor")
     chart_left, chart_right = st.columns(2)
     with chart_left:
         st.plotly_chart(
-            build_bar_chart(result.status_counts),
-            use_container_width=True,
+            build_productivity_by_server_chart(result.summary_by_server),
+            width="stretch",
             config={"displayModeBar": False},
         )
     with chart_right:
         st.plotly_chart(
-            build_pie_chart(result.status_counts),
-            use_container_width=True,
+            build_productivity_rate_chart(result.summary_by_server),
+            width="stretch",
             config={"displayModeBar": False},
         )
 
+    st.subheader("Distribuição")
+    st.plotly_chart(
+        build_pie_chart(result.status_counts),
+        width="stretch",
+        config={"displayModeBar": False},
+    )
+
+    _render_exports(result)
+    _render_tables(result)
+
+
+def _render_exports(result: ProductivityResult) -> None:
     st.subheader("Exportações")
-    export_left, export_middle, export_right = st.columns(3)
-    with export_left:
+    first, second, third, fourth = st.columns(4)
+    with first:
         st.download_button(
-            "Baixar excluídos",
-            data=cached_excel_bytes(result.excluded_processes, "Excluídos"),
-            file_name=timestamped_filename("processos_excluidos"),
+            "Relatório completo",
+            data=cached_report_bytes(
+                result.summary_by_server,
+                result.current_enriched,
+                result.productive_processes,
+                result.new_processes,
+                result.old_comparison,
+            ),
+            file_name=timestamped_filename("relatorio_produtividade"),
             mime=EXCEL_MIME_TYPE,
-            use_container_width=True,
-            disabled=result.excluded_processes.empty,
+            width="stretch",
         )
-    with export_middle:
+    with second:
         st.download_button(
-            "Baixar novos",
+            "Produtivos",
+            data=cached_excel_bytes(result.productive_processes, "Produtivos"),
+            file_name=timestamped_filename("processos_produtivos"),
+            mime=EXCEL_MIME_TYPE,
+            width="stretch",
+            disabled=result.productive_processes.empty,
+        )
+    with third:
+        st.download_button(
+            "Novos",
             data=cached_excel_bytes(result.new_processes, "Novos"),
             file_name=timestamped_filename("processos_novos"),
             mime=EXCEL_MIME_TYPE,
-            use_container_width=True,
+            width="stretch",
             disabled=result.new_processes.empty,
         )
-    with export_right:
+    with fourth:
         st.download_button(
-            "Baixar completo com anotações",
-            data=cached_excel_bytes(result.final_dataframe, "Planilha final"),
-            file_name=timestamped_filename("planilha_com_anotacoes"),
+            "Atual enriquecida",
+            data=cached_excel_bytes(result.current_enriched, "Atual enriquecida"),
+            file_name=timestamped_filename("planilha_atual_enriquecida"),
             mime=EXCEL_MIME_TYPE,
-            use_container_width=True,
+            width="stretch",
         )
 
+
+def _render_tables(result: ProductivityResult) -> None:
     st.subheader("Tabelas")
-    excluded_tab, new_tab, maintained_tab = st.tabs(
-        ["Excluídos", "Novos", "Mantidos"]
+    summary_tab, productive_tab, new_tab, current_tab, old_tab = st.tabs(
+        [
+            "Resumo",
+            "Produtivos",
+            "Novos",
+            "Atual enriquecida",
+            "Lista antiga",
+        ]
     )
-    with excluded_tab:
+    with summary_tab:
+        st.dataframe(
+            result.summary_by_server,
+            hide_index=True,
+            width="stretch",
+        )
+    with productive_tab:
         render_filterable_table(
-            "Processos excluídos",
-            result.excluded_processes,
-            "excluded",
+            "Processos produtivos",
+            result.productive_processes,
+            "productive",
         )
     with new_tab:
         render_filterable_table(
@@ -410,30 +412,57 @@ def _render_results(result: ComparisonResult) -> None:
             result.new_processes,
             "new",
         )
-    with maintained_tab:
+    with current_tab:
         render_filterable_table(
-            "Processos mantidos",
-            result.maintained_processes,
-            "maintained",
+            "Planilha atual enriquecida",
+            result.current_enriched,
+            "current",
+            height=460,
+        )
+    with old_tab:
+        render_filterable_table(
+            "Lista 01.26 comparada",
+            result.old_comparison,
+            "old",
+            height=460,
         )
 
 
+def _local_xlsx_files() -> list[Path]:
+    return sorted(
+        path
+        for path in Path.cwd().glob("*.xlsx")
+        if path.is_file() and not path.name.startswith("~$")
+    )
+
+
+def _guess_file_index(paths: list[Path], terms: tuple[str, ...]) -> int:
+    lowered_terms = tuple(term.casefold() for term in terms)
+    for index, path in enumerate(paths):
+        name = path.name.casefold()
+        if all(term in name for term in lowered_terms):
+            return index
+    return 0
+
+
+def _local_workbook_input(path: Path) -> WorkbookInput:
+    return WorkbookInput(
+        name=path.name,
+        bytes_data=cached_local_file(str(path), path.stat().st_mtime_ns),
+        source_label="pasta do projeto",
+    )
+
+
 def _build_signature(
-    old_bytes: bytes,
-    new_bytes: bytes,
-    old_sheet_name: str,
-    new_sheet_name: str,
-    old_config: SheetConfig,
-    new_config: SheetConfig,
+    server_bytes: bytes,
+    current_bytes: bytes,
+    current_sheet_name: str,
 ) -> str:
     payload = "|".join(
         [
-            _hash_bytes(old_bytes),
-            _hash_bytes(new_bytes),
-            old_sheet_name,
-            new_sheet_name,
-            repr(old_config),
-            repr(new_config),
+            _hash_bytes(server_bytes),
+            _hash_bytes(current_bytes),
+            current_sheet_name,
         ]
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()

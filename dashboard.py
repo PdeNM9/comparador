@@ -2,19 +2,14 @@
 
 from __future__ import annotations
 
-from typing import Iterable
-import unicodedata
-
 import pandas as pd
 import streamlit as st
-
-from comparison import ComparisonResult
 
 
 def configure_page() -> None:
     """Configure Streamlit before any page element is rendered."""
     st.set_page_config(
-        page_title="Comparador de Planilhas Judiciais",
+        page_title="Produtividade por Servidor",
         layout="wide",
         initial_sidebar_state="expanded",
     )
@@ -33,6 +28,7 @@ def inject_styles() -> None:
             --blue: #3a6ea5;
             --green: #2a9d8f;
             --red: #d95f59;
+            --yellow: #d9a441;
         }
         .block-container {
             padding-top: 2rem;
@@ -67,6 +63,7 @@ def inject_styles() -> None:
         }
         .metric-card.green { border-left-color: var(--green); }
         .metric-card.red { border-left-color: var(--red); }
+        .metric-card.yellow { border-left-color: var(--yellow); }
         .metric-label {
             color: var(--muted);
             display: block;
@@ -101,50 +98,31 @@ def inject_styles() -> None:
 
 
 def render_header() -> None:
+    """Render the app header."""
     st.markdown(
         """
         <div class="app-header">
-            <p>Comparação de processos judiciais</p>
-            <h1>Comparador de planilhas Excel</h1>
+            <p>Produtividade judicial</p>
+            <h1>Comparativo por servidor</h1>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
 
-def render_metric_cards(result: ComparisonResult) -> None:
-    """Render dashboard cards with totals and comparison counts."""
+def render_productivity_metric_cards(result) -> None:
+    """Render dashboard cards with productivity counters."""
     metrics = [
+        ("Servidores", result.server_count, "abas processadas", ""),
+        ("Lista 01.26", result.old_unique_processes, "processos únicos", ""),
+        ("Arquivo 120 dias", result.current_unique_processes, "processos atuais", ""),
         (
-            "Total Planilha 1",
-            result.old_total_rows,
-            f"{format_int(result.old_unique_processes)} CNJs únicos",
-            "",
-        ),
-        (
-            "Total Planilha 2",
-            result.new_total_rows,
-            f"{format_int(result.new_unique_processes)} CNJs únicos",
-            "",
-        ),
-        (
-            "Excluídos",
-            len(result.excluded_processes),
-            "existiam apenas na Planilha 1",
-            "red",
-        ),
-        (
-            "Novos",
-            len(result.new_processes),
-            "existem apenas na Planilha 2",
+            "Produtivos",
+            result.productive_unique_processes,
+            "saíram do arquivo 120 dias",
             "green",
         ),
-        (
-            "Mantidos",
-            len(result.maintained_processes),
-            "presentes nas duas planilhas",
-            "",
-        ),
+        ("Novos", result.new_unique_processes, "não estavam na lista 01.26", "yellow"),
     ]
 
     columns = st.columns(len(metrics))
@@ -162,29 +140,31 @@ def render_metric_cards(result: ComparisonResult) -> None:
             )
 
 
-def render_quality_messages(result: ComparisonResult) -> None:
+def render_productivity_quality_messages(result) -> None:
     """Show duplicate and empty-CNJ notices without blocking the workflow."""
-    if result.old_empty_cnj_rows or result.new_empty_cnj_rows:
+    if result.old_empty_cnj_rows or result.current_empty_cnj_rows:
         st.info(
-            "Linhas com CNJ vazio foram preservadas no arquivo final, mas "
-            "não entraram no cálculo de novos, excluídos ou mantidos. "
-            f"Planilha 1: {format_int(result.old_empty_cnj_rows)}; "
-            f"Planilha 2: {format_int(result.new_empty_cnj_rows)}."
+            "Linhas com CNJ vazio não entram na produtividade. "
+            f"Lista 01.26: {format_int(result.old_empty_cnj_rows)}; "
+            f"arquivo atual: {format_int(result.current_empty_cnj_rows)}."
         )
+
+    if result.skipped_empty_sheets:
+        sheets = ", ".join(result.skipped_empty_sheets)
+        st.info(f"Abas vazias ignoradas: {sheets}.")
 
     for report in result.duplicate_reports:
         st.warning(
-            f"{report.sheet_label}: {format_int(report.duplicated_processes)} "
+            f"{report.source_label}: {format_int(report.duplicated_processes)} "
             "CNJs duplicados encontrados em "
             f"{format_int(report.duplicated_rows)} linhas. A comparação "
-            "continuou e valores de responsável/anotação foram concatenados "
-            "por CNJ."
+            "continuou com consolidação por CNJ."
         )
-        with st.expander(f"Amostra de duplicados - {report.sheet_label}"):
+        with st.expander(f"Amostra de duplicados - {report.source_label}"):
             st.dataframe(
                 report.sample,
                 hide_index=True,
-                use_container_width=True,
+                width="stretch",
             )
 
 
@@ -199,7 +179,7 @@ def render_filterable_table(
     query = st.text_input(
         f"Filtrar {title.lower()}",
         key=f"filter_{key}",
-        placeholder="Digite parte do CNJ ou do responsável",
+        placeholder="Digite parte do CNJ, servidor ou situação",
     )
     filtered = filter_dataframe(dataframe, query)
     st.caption(
@@ -209,7 +189,7 @@ def render_filterable_table(
     st.dataframe(
         filtered,
         hide_index=True,
-        use_container_width=True,
+        width="stretch",
         height=height,
     )
     return filtered
@@ -232,47 +212,11 @@ def filter_dataframe(dataframe: pd.DataFrame, query: str) -> pd.DataFrame:
     return dataframe[mask]
 
 
-def guess_column(columns: Iterable[object], preferred_terms: Iterable[str]):
-    """Return the first column whose label contains one preferred term."""
-    columns = list(columns)
-    normalized_terms = [_normalize_text(term) for term in preferred_terms]
-
-    for term in normalized_terms:
-        for column in columns:
-            if term in _normalize_text(column):
-                return column
-
-    return columns[0] if columns else None
-
-
-def guess_annotation_columns(columns: Iterable[object]) -> list[object]:
-    """Guess annotation-like columns while still requiring user confirmation."""
-    terms = (
-        "anot",
-        "observ",
-        "coment",
-        "nota",
-        "andamento",
-        "providencia",
-        "pendencia",
-    )
-    guessed = []
-    for column in columns:
-        normalized = _normalize_text(column)
-        if any(term in normalized for term in terms):
-            guessed.append(column)
-    return guessed
-
-
 def format_int(value: int) -> str:
     """Format integers using the Brazilian thousands separator."""
     return f"{int(value):,}".replace(",", ".")
 
 
-def _normalize_text(value: object) -> str:
-    text = str(value)
-    ascii_text = unicodedata.normalize("NFKD", text).encode(
-        "ascii",
-        "ignore",
-    )
-    return ascii_text.decode("ascii").casefold()
+def format_percent(value: float) -> str:
+    """Format a percentage using the Brazilian decimal separator."""
+    return f"{float(value):.1f}%".replace(".", ",")
