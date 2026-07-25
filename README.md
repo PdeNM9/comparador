@@ -1,40 +1,79 @@
-# Comparador de Planilhas Judiciais
+# Produtividade por Servidor
 
-Aplicação web em Python + Streamlit para comparar duas planilhas Excel
-contendo processos judiciais e gerar uma nova planilha com anotações
-transferidas da situação anterior para a situação atual.
+Aplicação web em Python + Streamlit para comparar uma lista antiga de
+processos distribuídos em abas por servidor com uma planilha atual de processos
+em 120 dias.
 
-## Funcionalidades
+## Regra de produtividade
 
-- Upload de duas planilhas `.xlsx`.
-- Escolha da aba de cada arquivo.
-- Seleção manual das colunas de CNJ, responsável e anotações.
-- Normalização do CNJ para comparação, removendo pontos, hífens, espaços e
-  outros caracteres não numéricos.
-- Identificação de processos excluídos, novos e mantidos.
-- Transferência automática das anotações da Planilha 1 para os processos
-  mantidos na Planilha 2.
-- Preservação de todas as linhas e da ordem original da Planilha 2.
-- Criação de novas colunas quando a Planilha 2 já possui uma coluna com o
-  mesmo nome da anotação selecionada.
-- Aviso de CNJs duplicados, com continuidade do processamento.
-- Concatenação de responsáveis e anotações duplicadas por CNJ.
-- Dashboard com cards, gráfico de barras, gráfico de pizza e tabelas
-  filtráveis.
-- Exportação em Excel dos excluídos, novos e arquivo completo final.
+Um processo conta como produtivo para o servidor quando:
 
-## Estrutura
+- estava em uma aba do arquivo `lista 01.26.xlsx`;
+- não aparece mais no arquivo atual de `120 dias`.
 
-```text
-app.py
-comparison.py
-excel_utils.py
-dashboard.py
-charts.py
-export.py
-requirements.txt
-README.md
-```
+A coluna `Situação` da lista antiga não entra no cálculo da produtividade. Ela
+é preservada apenas como informação histórica.
+
+## Formato esperado
+
+### Arquivo dos servidores
+
+Workbook `.xlsx` com uma aba por servidor. O nome da aba é usado
+automaticamente como o nome do servidor.
+
+Cada aba deve conter:
+
+- `Número do Processo`
+- `Situação`
+- `Observação`
+
+Colunas extras, como `Unnamed: 3`, são preservadas no comparativo e nas
+exportações.
+
+### Arquivo atual
+
+Workbook `.xlsx` com a planilha atual de processos em 120 dias, contendo:
+
+- `Descrição Classe`
+- `Número Processo`
+- `Quantidade de Dias na Situação Atual Processo`
+- `Situação Atual`
+- `Última Tarefa PJE`
+
+## Saídas do app
+
+O dashboard mostra:
+
+- total de servidores;
+- total de processos da lista antiga;
+- total de processos atuais;
+- quantidade de processos produtivos;
+- quantidade de processos novos;
+- ranking de produtividade por servidor;
+- tabelas filtráveis de resumo, produtivos, novos, atual enriquecida e lista
+  antiga comparada.
+
+## Exportações
+
+O relatório completo em Excel possui estas abas:
+
+- `Resumo por servidor`
+- `Atual enriquecida`
+- `Produtivos - saíram`
+- `Novos`
+- `Lista antiga comparada`
+
+A planilha atual enriquecida mantém todas as colunas originais do arquivo atual
+e adiciona:
+
+- `Servidor`
+- `Situação anterior`
+- `Observação anterior`
+- colunas extras anteriores, quando existirem;
+- `Status comparativo`, com `Permaneceu`, `Novo` ou `CNJ vazio`.
+
+Os processos com status `Saiu` aparecem na aba `Produtivos - saíram`, pois não
+existem na planilha atual.
 
 ## Instalação
 
@@ -62,61 +101,26 @@ py -m pip install -r requirements.txt
 streamlit run app.py
 ```
 
-Depois disso, abra o endereço local exibido pelo Streamlit, normalmente:
+O endereço local padrão é:
 
 ```text
 http://localhost:8501
 ```
 
-## Como usar
+## Uso
 
-1. Envie a Planilha 1, que representa a situação anterior.
-2. Envie a Planilha 2, que representa a situação atual.
-3. Na barra lateral, escolha a aba de cada arquivo.
-4. Escolha a coluna CNJ e a coluna responsável em cada planilha.
-5. Escolha, na Planilha 1, as colunas que devem ser tratadas como anotações.
-6. Clique em `Comparar planilhas`.
-7. Revise os cards, gráficos e tabelas.
-8. Baixe os arquivos desejados.
+1. Envie o arquivo dos servidores ou marque a opção para usar os `.xlsx`
+   detectados na pasta do projeto.
+2. Envie o arquivo atual de 120 dias.
+3. Se o arquivo atual tiver mais de uma aba, escolha a aba correta na barra
+   lateral.
+4. Clique em `Processar produtividade`.
+5. Revise o dashboard e baixe as exportações.
 
-## Regras de comparação
+## Observações técnicas
 
-A comparação considera exclusivamente o CNJ normalizado. Assim, estes dois
-valores são considerados o mesmo processo:
-
-```text
-0000000-00.0000.0.00.0000
-00000000000000000000
-```
-
-Campos como classe, movimentação, vara, assunto ou qualquer outra coluna não
-interferem na identificação de novos, excluídos ou mantidos.
-
-## Regras para duplicidades
-
-Quando há CNJs duplicados, a aplicação informa o usuário e continua:
-
-- os processos são contados por CNJ normalizado único;
-- responsáveis duplicados são concatenados, preservando valores únicos;
-- anotações duplicadas da Planilha 1 são concatenadas por coluna;
-- o arquivo final preserva todas as linhas da Planilha 2, inclusive eventuais
-  duplicidades.
-
-## Arquivo final
-
-O Excel completo gerado contém:
-
-- todas as linhas da Planilha 2;
-- todas as colunas originais da Planilha 2;
-- colunas de anotações copiadas da Planilha 1;
-- linhas na mesma ordem da Planilha 2;
-- células de anotação vazias para processos novos.
-
-Se uma coluna de anotação da Planilha 1 já existir na Planilha 2, a aplicação
-cria uma nova coluna com o sufixo `- Planilha 1`.
-
-## Observações
-
-Planilhas com dezenas de milhares de linhas são processadas com operações
-vetorizadas do Pandas. A exportação usa `openpyxl` e aplica formatação simples,
-filtro automático e congelamento da primeira linha.
+- A comparação usa apenas o número CNJ normalizado, removendo pontuação,
+  hífens, espaços e outros caracteres não numéricos.
+- As operações principais são vetorizadas com Pandas.
+- A exportação usa `openpyxl`, com filtros, congelamento de cabeçalho e ajuste
+  básico de largura das colunas.
