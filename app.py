@@ -9,11 +9,6 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
-from charts import (
-    build_pie_chart,
-    build_productivity_by_server_chart,
-    build_productivity_rate_chart,
-)
 from dashboard import (
     configure_page,
     format_int,
@@ -42,6 +37,11 @@ SERVER_FILE_KEY = "server_file"
 CURRENT_FILE_KEY = "current_file"
 RESULT_KEY = "productivity_result"
 SIGNATURE_KEY = "productivity_signature"
+STATUS_COLORS = {
+    "Produtivos": "#2A9D8F",
+    "Permaneceram": "#3A6EA5",
+    "Novos": "#D9A441",
+}
 
 
 @dataclass(frozen=True)
@@ -315,20 +315,20 @@ def _render_results(result: ProductivityResult) -> None:
     st.subheader("Produtividade por servidor")
     chart_left, chart_right = st.columns(2)
     with chart_left:
-        st.plotly_chart(
+        _render_plotly_chart(
             build_productivity_by_server_chart(result.summary_by_server),
             width="stretch",
             config={"displayModeBar": False},
         )
     with chart_right:
-        st.plotly_chart(
+        _render_plotly_chart(
             build_productivity_rate_chart(result.summary_by_server),
             width="stretch",
             config={"displayModeBar": False},
         )
 
     st.subheader("Distribuição")
-    st.plotly_chart(
+    _render_plotly_chart(
         build_pie_chart(result.status_counts),
         width="stretch",
         config={"displayModeBar": False},
@@ -426,6 +426,151 @@ def _render_tables(result: ProductivityResult) -> None:
             "old",
             height=460,
         )
+
+
+def _render_plotly_chart(figure, **kwargs) -> None:
+    if figure is None:
+        st.warning(
+            "Os gráficos não puderam ser carregados. Confirme se o pacote "
+            "`plotly` está instalado no ambiente do Streamlit."
+        )
+        return
+    st.plotly_chart(figure, **kwargs)
+
+
+def build_productivity_by_server_chart(summary):
+    """Create a stacked bar chart with productive and remaining processes."""
+    go = _load_plotly()
+    if go is None:
+        return None
+    if summary.empty:
+        return _empty_figure(go, "Sem dados para exibir")
+
+    ordered = summary.sort_values("Produtivos (saíram)", ascending=True)
+    figure = go.Figure()
+    figure.add_bar(
+        y=ordered["Servidor"],
+        x=ordered["Produtivos (saíram)"],
+        name="Produtivos",
+        orientation="h",
+        marker_color="#2A9D8F",
+        hovertemplate="%{y}: %{x} produtivos<extra></extra>",
+    )
+    figure.add_bar(
+        y=ordered["Servidor"],
+        x=ordered["Ainda no arquivo 120 dias"],
+        name="Ainda no 120 dias",
+        orientation="h",
+        marker_color="#3A6EA5",
+        hovertemplate="%{y}: %{x} ainda no arquivo<extra></extra>",
+    )
+    figure.update_layout(
+        barmode="stack",
+        height=420,
+        margin=dict(l=24, r=24, t=30, b=24),
+        template="plotly_white",
+        xaxis_title="Processos",
+        yaxis_title=None,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02),
+    )
+    return figure
+
+
+def build_productivity_rate_chart(summary):
+    """Create a ranking chart with productivity percentage by server."""
+    go = _load_plotly()
+    if go is None:
+        return None
+    if summary.empty:
+        return _empty_figure(go, "Sem dados para exibir")
+
+    ordered = summary.sort_values("% produtividade", ascending=False)
+    figure = go.Figure(
+        data=[
+            go.Bar(
+                x=ordered["Servidor"],
+                y=ordered["% produtividade"],
+                marker_color="#2A9D8F",
+                text=ordered["% produtividade"].map(lambda value: f"{value:.1f}%"),
+                textposition="outside",
+                hovertemplate="%{x}: %{y:.1f}%<extra></extra>",
+            )
+        ]
+    )
+    figure.update_layout(
+        height=360,
+        margin=dict(l=24, r=24, t=30, b=24),
+        template="plotly_white",
+        xaxis_title=None,
+        yaxis_title="% produtividade",
+        uniformtext_minsize=10,
+        uniformtext_mode="show",
+    )
+    figure.update_yaxes(rangemode="tozero", ticksuffix="%")
+    return figure
+
+
+def build_pie_chart(counts: dict[str, int]):
+    """Create a donut chart showing the global comparison distribution."""
+    go = _load_plotly()
+    if go is None:
+        return None
+
+    labels = list(counts.keys())
+    values = [counts[label] for label in labels]
+    colors = [STATUS_COLORS.get(label, "#6B7280") for label in labels]
+
+    if not any(values):
+        return _empty_figure(go, "Sem dados para exibir")
+
+    figure = go.Figure(
+        data=[
+            go.Pie(
+                labels=labels,
+                values=values,
+                hole=0.48,
+                marker=dict(colors=colors),
+                textinfo="label+percent",
+                hovertemplate="%{label}: %{value}<extra></extra>",
+            )
+        ]
+    )
+    figure.update_layout(
+        height=360,
+        margin=dict(l=24, r=24, t=30, b=24),
+        template="plotly_white",
+        showlegend=False,
+    )
+    return figure
+
+
+def _empty_figure(go, message: str):
+    figure = go.Figure()
+    figure.add_annotation(
+        text=message,
+        x=0.5,
+        y=0.5,
+        xref="paper",
+        yref="paper",
+        showarrow=False,
+        font=dict(size=16, color="#6B7280"),
+    )
+    figure.update_layout(
+        height=360,
+        margin=dict(l=24, r=24, t=30, b=24),
+        template="plotly_white",
+        xaxis=dict(visible=False),
+        yaxis=dict(visible=False),
+    )
+    return figure
+
+
+def _load_plotly():
+    try:
+        import plotly.graph_objects as go
+    except ImportError:
+        return None
+    return go
 
 
 def _local_xlsx_files() -> list[Path]:
